@@ -1,0 +1,156 @@
+import pandas as pd
+import numpy as np
+np.random.seed(0)
+
+import xgboost as xgb
+import catboost as ctb
+import lightgbm as lgb
+from functools import partial
+from hyperopt import hp
+from hyperopt import hp, fmin, tpe, STATUS_OK, STATUS_FAIL, Trials
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+import holidays
+import calendar
+import datetime
+
+from sklearn.model_selection import GroupKFold
+
+from sklearn.dummy import DummyRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scikitplot.estimators import plot_learning_curve
+import eli5
+%matplotlib inline
+
+
+
+df_train = pd.read_hdf("../input/energy_train.h5")
+df_test = pd.read_hdf("../input/energy_test.h5")
+
+df_train.shape, df_test.shape
+
+df_train.isnull().any()
+
+df=pd.concat([df_train,df_test])
+
+df.shape
+
+df['date']=pd.to_datetime(df['date'])
+
+
+
+
+def feature_engineering(df):
+    
+    df['date_year']=df['date'].dt.year
+    df['date_diff_year']=df['date_year']-2018
+    df['date_month']=df['date'].dt.month
+    df['date_day']=df['date'].dt.day
+    df['date_hour']=df['date'].dt.hour
+    df['date_dayofweek']=df['date'].dt.dayofweek
+    df['date_dayofyear']=df['date'].dt.dayofyear   
+    df['date_week']=df['date'].dt.week
+    df['date_weekend']=df['date_dayofweek'].map(lambda x: int(x in[5,6]))
+    df['day_']=df[['date_year', 'date_dayofyear']].apply(lambda x: x['date_dayofyear']+int(str(x['date_year'])[-1])*365, axis=1)
+    df['rush_hour'] = df['date_hour'].map(lambda x: 0 if (x < 7 or x> 22) else 1)
+    df['holidays'] =df['date'].dt.date.isin(holidays.CountryHoliday('PL',years=[2018,2019,2020,2021,2022])).astype(int) 
+    df['peak']= df[['rush_hour', 'date_weekend', 'holidays']].apply(lambda x: 1 if (x['rush_hour']==1)& (x['date_weekend']==0) & (x['holidays']==0) else 0, axis=1)
+    df['workingday']=df[['date_weekend', 'holidays']].apply(lambda x: 1 if ((x['date_weekend']==0) & (x['holidays']==0)) else 0, axis=1)
+
+    df['day_of_month']=df['date'].dt.daysinmonth
+    df['day_month_ratio']=df['day_of_month']/df['date_day']
+    df['date_norm']=pd.to_datetime(df['date']).dt.normalize()
+    df['date_day_ratio']=df.apply(lambda x: x['date_dayofyear']/366  if (x['date_year']==2020) else x['date_dayofyear']/365, axis=1)
+    df['date_week_ratio']=df['date_dayofweek'].map(lambda x: (x+1)/7)
+  
+    def get_season(x):
+        if (x['date_month'] in [1,2,3]): return 1 #('date_month' in [1,2,3]
+        if (x['date_month'] in [4,5,6]): return 2 
+        if (x['date_month'] in [7,8,9]): return 3 
+        if (x['date_month'] in [10,11,12]): return 4  
+        return x['date_month']
+    df['season']=df.apply(get_season, axis=1)
+    
+    
+#    df_train = df[ df.value.notnull() ]
+      
+#    group_features = {
+#        "group_mean_hour_dayofweek": ["date_hour", "date_dayofweek"],
+#        "group_mean_hour_month": ["date_hour", "date_month"],
+#        "group_mean_hour_dayofweek_month": ["date_hour", "date_dayofweek", "date_month"],
+#        "group_mean_hour_season": ["date_hour", "season"],  #season: musi byc done: nr 2 - sezon/year
+#                    }
+#    for feat_name,group_keys in group_features.items(): 
+#        dict_group = {k:v["value"] for k,v in df_train[["value"] + group_keys].groupby(group_keys).agg("mean").to_dict(orient="items").items() }
+#        df[feat_name] = df[ group_keys ].apply(lambda keys: dict_group.get(tuple(keys)), axis=1)  
+    
+#    group_features3 = {
+#        "group_std_hour_dayofweek": ["date_hour", "date_dayofweek"],
+#        "group_std_hour_month": ["date_hour", "date_month"],
+#        "group_std_hour_dayofweek_month": ["date_hour", "date_dayofweek", "date_month"],                
+#    }
+#    for feat_name,group_keys in group_features3.items(): 
+#        dict_group3 = {k:v["value"] for k,v in df_train[["value"] + group_keys].groupby(group_keys).agg("std").to_dict(orient="items").items() }
+#        df[feat_name] = df[ group_keys ].apply(lambda keys: dict_group3.get(tuple(keys)), axis=1) 
+   
+    df['is_month_start']=df['date'].dt.is_month_start
+    df['date_quarter']=df['date'].dt.quarter
+    df['is_month_endt']=df['date'].dt.is_month_end
+    df['is_quarter_start']=df['date'].dt.is_quarter_start   
+    df['is_quarter_end']=df['date'].dt.is_quarter_end   
+    df['is_year_start']=df['date'].dt.is_year_start   
+    df['is_year_end']=df['date'].dt.is_year_end   
+    df['is_leap_year']=df['date'].dt.is_leap_year   
+
+    obj_bool=df.select_dtypes(bool).columns
+    for cat_feat in obj_bool:
+        df['{0}_cat'.format(cat_feat)]=pd.factorize(df[cat_feat])[0].astype(np.int8)
+        del df[cat_feat]
+    
+    return df  
+  
+
+df_all = feature_engineering(df)
+df_all 
+
+
+feats=df_all.select_dtypes("number").columns
+black_list=["id", "value"]
+
+feats=[x for x in feats if x not in black_list]
+feats
+
+
+
+df_train=df_all[df_all["value"].notnull()].copy()
+df_test=df_all[df_all["value"].isnull()].copy()
+
+X_train=df_train[feats].values
+y_train=df_train["value"].values
+X_test=df_test[feats].values
+
+
+model_26_03_32 = xgb.XGBRegressor(colsample_bytree=0.8959618854956757, learning_rate= 0.12623568632072973, max_depth=8, min_child_weight=9, random_state=1050, reg_alpha=2.185148635403625, reg_lambda=0.9955734878398015, subsample=0.7991228266992959)
+model_26_03_32.fit(X_train, y_train)
+y_pred_26_03_32 = model_26_03_32.predict(X_test)
+
+
+df_test["value"] = y_pred_26_03_32
+df_test[["id", "value"]].to_csv("../output/xgb_y_pred_26_03_No_32.csv", index=False)
+
+
+
+# TESTY WEWNETRZNE
+cv = GroupKFold(n_splits=5)
+
+model = xgb.XGBRegressor(max_depth=7, n_estimators=100, learning_rate=0.1, random_state=0)
+scores = cross_val_score(model, X_train, y_train, groups=df_train["date_day"], cv=cv, scoring="neg_mean_absolute_error")
+print("score: ", np.mean(scores), "std: ", np.std(scores))
+
+eli5.show_weights(model_26_03_32, feature_names=feats)
+
+
+
